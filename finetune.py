@@ -25,6 +25,7 @@ from transformers import (
 from peft import LoraConfig, get_peft_model, TaskType
 import argparse
 
+os.environ["WANDB_PROJECT"] = "arc-llm-jepa"
 
 def get_messages(model_name, messages):
     if "google/gemma" in model_name:
@@ -67,6 +68,66 @@ def load_and_prepare_dataset(data_file, tokenizer, model_name,
     dataset = load_dataset('json', data_files=data_file)['train']
     if  torch.cuda.current_device() == 0:
         print(f"Loaded {len(dataset)} examples from {data_file}")
+
+    def format_full_conversation(messages):
+        full_messages = get_messages(model_name, messages)
+        if plain:
+            if train_all:
+                return full_messages, messages[1]["content"] + "<|eot_id|>"
+            return full_messages, messages[1]["content"] + "<|perception|>" + messages[2]["content"] + "<|eot_id|>"
+        return full_messages, tokenizer.apply_chat_template(
+            full_messages,
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+
+    def format_prompt_for_generation(messages, full_messages=None):
+        if plain:
+            if train_all:
+                return messages[1]["content"]
+            return messages[1]["content"] + "<|perception|>"
+        if full_messages is None:
+            full_messages = get_messages(model_name, messages)
+        return tokenizer.apply_chat_template(
+            full_messages[:-1],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+    def tokenize_chat_text(text, truncation, padding=False):
+        return tokenizer(
+            text,
+            truncation=truncation,
+            max_length=max_length if truncation else None,
+            padding="max_length" if padding else False,
+            add_special_tokens=False,
+            return_tensors=None,
+        )
+
+    def compute_supervised_start(messages, input_length, full_messages=None):
+        prompt_text = format_prompt_for_generation(messages, full_messages=full_messages)
+        prompt_tokens = tokenize_chat_text(prompt_text, truncation=False)["input_ids"]
+        return min(len(prompt_tokens), input_length)
+
+    if torch.cuda.current_device() == 0:
+        prompt_overflow = 0
+        sample_overflow = 0
+        for example in dataset:
+            full_messages, formatted_chat = format_full_conversation(example["messages"])
+            prompt_len = len(tokenize_chat_text(
+                format_prompt_for_generation(example["messages"], full_messages=full_messages),
+                truncation=False,
+            )["input_ids"])
+            full_len = len(tokenize_chat_text(formatted_chat, truncation=False)["input_ids"])
+            if prompt_len >= max_length:
+                prompt_overflow += 1
+            if full_len > max_length:
+                sample_overflow += 1
+        if prompt_overflow or sample_overflow:
+            print(
+                f"Warning: {sample_overflow}/{len(dataset)} samples exceed max_length={max_length}; "
+                f"{prompt_overflow} have prompts that already fill the full budget, so they contribute no assistant labels."
+            )
     
     def tokenize_conversations(examples):
         """Tokenize conversations and mask input tokens properly"""
@@ -82,26 +143,13 @@ def load_and_prepare_dataset(data_file, tokenizer, model_name,
 
         for msg_idx, messages in enumerate(examples['messages']):
             # Apply chat template if available, otherwise format manually
-            full_messages = get_messages(model_name, messages)
-            if plain:
-                if train_all:
-                    formatted_chat = messages[1]["content"] + "<|eot_id|>"
-                else:
-                    formatted_chat = messages[1]["content"] + "<|perception|>" + messages[2]["content"] + "<|eot_id|>"
-            else:
-                formatted_chat = tokenizer.apply_chat_template(
-                    full_messages,
-                    tokenize=False,
-                    add_generation_prompt=False,
-                )
+            full_messages, formatted_chat = format_full_conversation(messages)
             
             # Tokenize the formatted conversation with padding to max_length
-            tokenized = tokenizer(
+            tokenized = tokenize_chat_text(
                 formatted_chat,
                 truncation=True,
-                max_length=max_length,
-                padding="max_length",  # Pad to max_length for consistent tensor shapes
-                return_tensors=None
+                padding=True,
             )
             
             input_ids = tokenized["input_ids"]
@@ -111,7 +159,7 @@ def load_and_prepare_dataset(data_file, tokenizer, model_name,
             if train_all:
                 labels = create_labels_for_all(input_ids, attention_mask)
             else:
-                labels = create_masked_labels(messages, tokenizer, input_ids, attention_mask)
+                labels = create_masked_labels(messages, input_ids, attention_mask, full_messages=full_messages)
             
             input_ids_list.append(input_ids)
             labels_list.append(labels)
@@ -147,6 +195,7 @@ def load_and_prepare_dataset(data_file, tokenizer, model_name,
                 truncation=True,
                 max_length=max_length,
                 padding="max_length",  # Pad to max_length for consistent tensor shapes
+                add_special_tokens=False,
                 return_tensors=None
             )
             user_input_ids_list.append(tokenized_user["input_ids"])
@@ -176,6 +225,7 @@ def load_and_prepare_dataset(data_file, tokenizer, model_name,
                 truncation=True,
                 max_length=max_length,
                 padding="max_length",  # Pad to max_length for consistent tensor shapes
+                add_special_tokens=False,
                 return_tensors=None
             )
             assistant_input_ids_list.append(tokenized_assistant["input_ids"])
@@ -245,48 +295,30 @@ def load_and_prepare_dataset(data_file, tokenizer, model_name,
                 labels.append(input_ids[i])
         return labels
 
-    def create_masked_labels(messages, tokenizer, input_ids, attention_mask):
+    def create_masked_labels(messages, input_ids, attention_mask, full_messages=None):
         """Create labels with input tokens masked (-100)"""
         labels = [-100] * len(input_ids)
-        
-        # Mask padding tokens in labels
-        for i, mask in enumerate(attention_mask):
-            if mask == 0:  # Padding token
-                labels[i] = -100
-        
-        # Find assistant responses and unmask only those tokens
-        for msg in messages:
-            if msg['role'] == 'assistant':
-                assistant_content = msg['content']
-                
-                # Find where this assistant response appears in the tokenized text
-                assistant_tokens = tokenizer.encode(assistant_content, add_special_tokens=False)
-                
-                # Find the position of assistant response in input_ids
-                decoded_assistant = [tokenizer.decode(item) for item in assistant_tokens]
-                decoded_input = [tokenizer.decode(item) for item in input_ids]
-                for i in range(len(input_ids) - len(assistant_tokens) + 1):
-                    # Only check non-padding tokens
-                    if debug == 4 and torch.cuda.current_device() == 0:
-                        print(f"=======input_ids: {input_ids[i:i+len(assistant_tokens)]}")
-                        print(f"assistant_tokens: {assistant_tokens}")
-                    # if attention_mask[i] == 1 and input_ids[i:i+len(assistant_tokens)] == assistant_tokens:
-                    if attention_mask[i] == 1 and decoded_input[i:i+len(assistant_tokens)] == decoded_assistant:
-                        # Unmask the assistant response tokens
-                        for j in range(i, min(i + len(assistant_tokens), len(input_ids))):
-                            if attention_mask[j] == 1:  # Only unmask non-padding tokens
-                                labels[j] = input_ids[j]
-                        break
-                
-                if debug == 4:
-                    exit(0)
-        
+
+        input_length = sum(attention_mask)
+        assistant_start = compute_supervised_start(messages, input_length, full_messages=full_messages)
+
+        for j in range(assistant_start, len(input_ids)):
+            if attention_mask[j] == 1:
+                labels[j] = input_ids[j]
+
+        if debug == 4 and torch.cuda.current_device() == 0:
+            print(f"assistant_start={assistant_start}, input_length={input_length}")
+            print(tokenizer.decode(input_ids[:input_length]))
+            print(tokenizer.decode([item for item in labels if item != -100]))
+            exit(0)
+
         return labels
     
     # Tokenize dataset
     tokenized_dataset = dataset.map(
         tokenize_conversations,
         batched=True,
+        num_proc=max(1, os.cpu_count() - 1) if hasattr(os, 'cpu_count') else 4,
         remove_columns=dataset.column_names
     )
     
@@ -461,6 +493,7 @@ def setup_model_and_tokenizer(model_name, use_lora=True, lora_rank=16, pretrain=
             torch_dtype=torch.bfloat16,
             device_map=device_map,
             trust_remote_code=True,
+            # attn_implementation="flash_attention_2",
             # Add these for better multi-GPU stability
             low_cpu_mem_usage=True,
             use_cache=False,  # Disable KV cache for training
@@ -512,25 +545,9 @@ class RepresentationTrainer(Trainer):
     
     def _last_token_index(self, input_ids, labels, attention_mask):
         index = []
-        def unpad(input_ids, attention_mask):
-            result = []
-            can_break = False
-            for id, mask in zip(input_ids, attention_mask):
-                if mask != 0:
-                    can_break = True
-                if mask == 0 and can_break:
-                    break
-                result.append(id)
-            return result
-
         for i in range(input_ids.shape[0]):
-            uii = unpad(input_ids[i], attention_mask[i])
-            if self.debug == 1 and torch.cuda.current_device() == 0:
-                print(f"====={len(uii)}=====")
-                print(input_ids[i][len(uii) - 4], input_ids[i][len(uii) - 3], input_ids[i][len(uii) - 2], input_ids[i][len(uii) - 1], -100 if len(uii) >= len(input_ids[i]) else input_ids[i][len(uii)])
-                print(labels[i][len(uii) - 4], labels[i][len(uii) - 3], labels[i][len(uii) - 2], labels[i][len(uii) - 1], -100 if len(uii) >= len(labels[i]) else labels[i][len(uii)])
-                print(attention_mask[i][len(uii) - 4], attention_mask[i][len(uii) - 3], attention_mask[i][len(uii) - 2], attention_mask[i][len(uii) - 1], -100 if len(uii) >= len(attention_mask[i]) else attention_mask[i][len(uii)])
-            index.append(len(uii) + self.last_token)
+            length = attention_mask[i].sum().item()
+            index.append(length + self.last_token)
         
         index_tensor = torch.tensor(index).to(input_ids.device)
         if self.debug == 1 and torch.cuda.current_device() == 0:
@@ -558,15 +575,23 @@ class RepresentationTrainer(Trainer):
         last_token = self._last_token_index(inputs["input_ids"], inputs["labels"], inputs["attention_mask"])        
         last_token_user = self._last_token_index(inputs["input_ids_user"], inputs["labels_user"], inputs["attention_mask_user"])
         last_token_assistant = self._last_token_index(inputs["input_ids_assistant"], inputs["labels_assistant"], inputs["attention_mask_assistant"])
+        clamped_assistant_lengths = []
         for i in range(inputs["input_ids_user"].shape[0]):
             length, length_user, length_assistant = last_token[i] + 1, last_token_user[i] + 1, last_token_assistant[i] + 1
-            inputs["input_ids_user"][i, length_user:length_user + length_assistant] = inputs["input_ids_assistant"][i, :length_assistant]
-            inputs["labels_user"][i, length_user:length_user + length_assistant] = inputs["labels_assistant"][i, :length_assistant]
+            # Clamp assistant length so user + assistant fits within seq_length
+            length_assistant_clamped = min(length_assistant, seq_length - length_user)
+            clamped_assistant_lengths.append(length_assistant_clamped)
+            if length_assistant_clamped > 0:
+                inputs["input_ids_user"][i, length_user:length_user + length_assistant_clamped] = inputs["input_ids_assistant"][i, :length_assistant_clamped]
+                inputs["labels_user"][i, length_user:length_user + length_assistant_clamped] = inputs["labels_assistant"][i, :length_assistant_clamped]
             mask[i, :, 0:length, 0:length] = self._build_additive_mask(length)
             mask[i + batch_size, :, 0:length_user, 0:length_user] = self._build_additive_mask(length_user)
-            mask[i + batch_size, :, length_user:length_user + length_assistant, length_user:length_user + length_assistant] = self._build_additive_mask(length_assistant)
+            if length_assistant_clamped > 0:
+                mask[i + batch_size, :, length_user:length_user + length_assistant_clamped, length_user:length_user + length_assistant_clamped] = self._build_additive_mask(length_assistant_clamped)
         self._last_token_user = last_token_user
-        self._last_token_assistant = last_token_assistant + last_token_user + 1
+        # Use clamped lengths for assistant index to avoid out-of-bounds access
+        clamped_assistant_tensor = torch.tensor(clamped_assistant_lengths, device=device) - 1
+        self._last_token_assistant = clamped_assistant_tensor + last_token_user + 1
         return {
                 "input_ids": torch.cat([inputs["input_ids"],
                                         inputs["input_ids_user"]], dim=0),
@@ -919,7 +944,6 @@ def main():
         os.makedirs(output_dir, exist_ok=True)
     training_args = TrainingArguments(
         output_dir=output_dir,
-        overwrite_output_dir=True,
         
         # Training parameters
         per_device_train_batch_size=args.batch_size,
@@ -959,7 +983,7 @@ def main():
         fsdp_config={},
         
         # Other
-        report_to="none",
+        report_to="wandb",
         remove_unused_columns=False,
         load_best_model_at_end=True if eval_dataset else False,
         
@@ -982,7 +1006,6 @@ def main():
             args=training_args,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
-            tokenizer=tokenizer,
             data_collator=data_collator,
             callbacks=[flop_callback] if args.track_flop else [],
         )
@@ -994,7 +1017,6 @@ def main():
             args=training_args,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
-            tokenizer=tokenizer,
             data_collator=data_collator,
             callbacks=[flop_callback] if args.track_flop else [],
             lbd=args.lbd,
