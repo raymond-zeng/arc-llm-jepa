@@ -121,7 +121,7 @@ def main():
         sampling_params = SamplingParams(
             temperature=args.temperature,
             max_tokens=args.max_new_tokens,
-            stop=["</solution>", "```\n"],
+            stop=["```\n"],
         )
     else:
         print(f"Loading base model {args.base_model}...")
@@ -173,8 +173,7 @@ def main():
     system_msg = (
         "Write python code to solve the following puzzles. Use only standard Python "
         "(no external libraries). Define a function `solve(grid)` that takes a 2D "
-        "list of integers and returns a 2D list of integers. Return only the complete "
-        "function inside <solution>...</solution> tags."
+        "list of integers and returns a 2D list of integers. Only write code and nothing else."
     )
 
     if use_vllm:
@@ -188,8 +187,7 @@ def main():
                     "role": "user",
                     "content": (
                         f"Train examples:\n{json.dumps(task_data['train'])}\n\n"
-                        "Respond with the complete solve function wrapped in "
-                        "<solution>...</solution>."
+                        "Only write code and nothing else."
                     ),
                 }
             ]
@@ -201,8 +199,7 @@ def main():
                 prompt = (
                     f"{system_msg}\n\n"
                     f"Train examples:\n{json.dumps(task_data['train'])}\n\n"
-                    "Respond with the complete solve function wrapped in "
-                    "<solution>...</solution>.\n\n"
+                    "Only write code and nothing else.\n\n"
                 )
             prompts.append(prompt)
 
@@ -266,8 +263,7 @@ def main():
                         "role": "user",
                         "content": (
                             f"Train examples:\n{json.dumps(task_data['train'])}\n\n"
-                            "Respond with the complete solve function wrapped in "
-                            "<solution>...</solution>."
+                            "Only write code and nothing else."
                         ),
                     }
                 ]

@@ -1,0 +1,13 @@
+datasets
+matplotlib
+numpy==2.4.4
+peft
+python-dotenv==1.2.2
+requests==2.33.1
+safetensors==0.7.0
+scikit-learn
+torch
+tqdm==4.67.3
+transformers==5.5.3
+vllm
+wandb
